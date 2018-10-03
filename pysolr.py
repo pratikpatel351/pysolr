@@ -9,12 +9,12 @@ import random
 import re
 import time
 from xml.etree import ElementTree
-from pkg_resources import DistributionNotFound, get_distribution, parse_version
 
 import requests
 
 try:
     from kazoo.client import KazooClient, KazooState
+    from kazoo.exceptions import NoNodeError
 except ImportError:
     KazooClient = KazooState = None
 
@@ -30,13 +30,6 @@ try:
 except ImportError:
     # Python 2.X
     from urllib import urlencode
-
-try:
-    # Python 3.X
-    from urllib.parse import quote
-except ImportError:
-    # Python 2.X
-    from urllib import quote
 
 try:
     # Python 3.X
@@ -63,22 +56,14 @@ except NameError:
 
 __author__ = 'Daniel Lindsley, Joseph Kocherhans, Jacob Kaplan-Moss'
 __all__ = ['Solr']
+__version__ = (3, 4, 0)
 
-try:
-    pkg_distribution = get_distribution(__name__)
-    __version__ = pkg_distribution.version
-    version_info = pkg_distribution.parsed_version
-except DistributionNotFound:
-    __version__ = '0.0.dev0'
-    version_info = parse_version(__version__)
 
 def get_version():
-    return __version__
+    return "%s.%s.%s" % __version__[:3]
 
 
 DATETIME_REGEX = re.compile('^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(\.\d+)?Z$')
-# dict key used to add nested documents to a document
-NESTED_DOC_KEY = '_childDocuments_'
 
 
 class NullHandler(logging.Handler):
@@ -263,15 +248,26 @@ class Results(object):
     Note that ``Results`` object does not support indexing and slicing. If you
     need to retrieve documents by index just use ``docs`` attribute.
 
-    Other common response metadata (debug, highlighting, qtime, etc.) are available as attributes.
+    Other response metadata (debug, highlighting, qtime, etc.) are available
+    as attributes. Note that not all response keys may be covered for current
+    version of pysolr. If you're sure that your queries return
+    something that is missing you can easily extend ``Results``
+    and provide it as a custom results class to ``pysolr.Solr``.
 
-    The full response from Solr is provided as the `raw_response` dictionary for use with features which
-    change the response format.
+    Example::
+
+        import pysolr
+
+        class CustomResults(pysolr.Results):
+            def __init__(self, decoded):
+                 self.some_new_attribute = decoded.get('not_covered_key' None)
+                 super(self, CustomResults).__init__(decoded)
+
+        solr = Solr('<solr url>', response_cls=CustomResults)
+
     """
 
     def __init__(self, decoded):
-        self.raw_response = decoded
-
         # main response part of decoded Solr response
         response_part = decoded.get('response') or {}
         self.docs = response_part.get('docs', ())
@@ -318,27 +314,18 @@ class Solr(object):
         solr = pysolr.Solr('http://localhost:8983/solr', results_cls=dict)
 
     """
-
-    def __init__(self, url, decoder=None, timeout=60, results_cls=Results, search_handler='select', use_qt_param=False, always_commit=False,
-                 auth=None, verify=True):
+    def __init__(self, url, decoder=None, timeout=60, results_cls=Results):
         self.decoder = decoder or json.JSONDecoder()
         self.url = url
         self.timeout = timeout
         self.log = self._get_log()
-        self.session = None
+        self.session = requests.Session()
+        self.session.stream = False
         self.results_cls = results_cls
-        self.search_handler = search_handler
-        self.use_qt_param = use_qt_param
-        self.auth = auth
-        self.verify = verify
-        self.always_commit = always_commit
 
-    def get_session(self):
-        if self.session is None:
-            self.session = requests.Session()
-            self.session.stream = False
-            self.session.verify = self.verify
-        return self.session
+    def __del__(self):
+        if hasattr(self, "session"):
+            self.session.close()
 
     def _get_log(self):
         return LOG
@@ -367,12 +354,10 @@ class Solr(object):
                        url, method, log_body[:10])
         start_time = time.time()
 
-        session = self.get_session()
-
         try:
-            requests_method = getattr(session, method)
+            requests_method = getattr(self.session, method, 'get')
         except AttributeError as err:
-            raise SolrError("Unable to use unknown HTTP method '{0}.".format(method))
+            raise SolrError("Unable to send HTTP method '{0}.".format(method))
 
         # Everything except the body can be Unicode. The body must be
         # encoded to bytes to work properly on Py3.
@@ -380,9 +365,10 @@ class Solr(object):
 
         if bytes_body is not None:
             bytes_body = force_bytes(body)
+
         try:
             resp = requests_method(url, data=bytes_body, headers=headers, files=files,
-                                   timeout=self.timeout, auth=self.auth)
+                                   timeout=self.timeout)
         except requests.exceptions.Timeout as err:
             error_message = "Connection to server '%s' timed out: %s"
             self.log.error(error_message, url, err, exc_info=True)
@@ -398,59 +384,49 @@ class Solr(object):
             raise SolrError(error_message % (method, url, err))
 
         end_time = time.time()
-        self.log.info("Finished '%s' (%s) with body '%s' in %0.3f seconds, with status %s",
-                      url, method, log_body[:10], end_time - start_time, resp.status_code)
+        self.log.info("Finished '%s' (%s) with body '%s' in %0.3f seconds.",
+                      url, method, log_body[:10], end_time - start_time)
 
         if int(resp.status_code) != 200:
             error_message = "Solr responded with an error (HTTP %s): %s"
             solr_message = self._extract_error(resp)
             self.log.error(error_message, resp.status_code, solr_message,
                            extra={'data': {'headers': resp.headers,
-                                           'response': resp.content,
-                                           'request_body': bytes_body,
-                                           'request_headers': headers}})
+                                           'response': resp.content}})
             raise SolrError(error_message % (resp.status_code, solr_message))
 
         return force_unicode(resp.content)
 
-    def _select(self, params, handler=None):
-        """
-        :param params:
-        :param handler: defaults to self.search_handler (fallback to 'select')
-        :return:
-        """
+    def _select(self, params, search_handler='select'):
         # specify json encoding of results
         params['wt'] = 'json'
-        custom_handler = handler or self.search_handler
-        handler = 'select'
-        if custom_handler:
-            if self.use_qt_param:
-                params['qt'] = custom_handler
-            else:
-                handler = custom_handler
-
         params_encoded = safe_urlencode(params, True)
 
         if len(params_encoded) < 1024:
             # Typical case.
-            path = '%s/?%s' % (handler, params_encoded)
+            path = '%s/?%s' % (search_handler, params_encoded)
             return self._send_request('get', path)
         else:
             # Handles very long queries by submitting as a POST.
-            path = '%s/' % handler
+            path = '%s/' % search_handler
             headers = {
                 'Content-type': 'application/x-www-form-urlencoded; charset=utf-8',
             }
             return self._send_request('post', path, body=params_encoded, headers=headers)
 
-    def _mlt(self, params, handler='mlt'):
-        return self._select(params, handler)
+    def _mlt(self, params):
+        # specify json encoding of results
+        params['wt'] = 'json'
+        path = 'mlt/?%s' % safe_urlencode(params, True)
+        return self._send_request('get', path)
 
-    def _suggest_terms(self, params, handler='terms'):
-        return self._select(params, handler)
+    def _suggest_terms(self, params):
+        # specify json encoding of results
+        params['wt'] = 'json'
+        path = 'terms/?%s' % safe_urlencode(params, True)
+        return self._send_request('get', path)
 
-    def _update(self, message, clean_ctrl_chars=True, commit=None, softCommit=False, waitFlush=None, waitSearcher=None,
-                overwrite=None, handler='update'):
+    def _update(self, message, clean_ctrl_chars=True, commit=True, softCommit=False, waitFlush=None, waitSearcher=None, overwrite=None, updateChain=None):
         """
         Posts the given xml message to http://<self.url>/update and
         returns the result.
@@ -460,25 +436,16 @@ class Solr(object):
         these characters would cause Solr to fail to parse the XML. Only pass
         False if you're positive your data is clean.
         """
+        path = 'update/'
 
         # Per http://wiki.apache.org/solr/UpdateXmlMessages, we can append a
         # ``commit=true`` to the URL and have the commit happen without a
         # second request.
         query_vars = []
 
-        path_handler = handler
-        if self.use_qt_param:
-            path_handler = 'select'
-            query_vars.append('qt=%s' % safe_urlencode(handler, True))
-
-        path = '%s/' % path_handler
-
-        if commit is None:
-            commit = self.always_commit
-
-        if commit:
+        if commit is not None:
             query_vars.append('commit=%s' % str(bool(commit)).lower())
-        elif softCommit:
+        elif softCommit is not None:
             query_vars.append('softCommit=%s' % str(bool(softCommit)).lower())
 
         if waitFlush is not None:
@@ -489,6 +456,9 @@ class Solr(object):
 
         if waitSearcher is not None:
             query_vars.append('waitSearcher=%s' % str(bool(waitSearcher)).lower())
+
+        if updateChain is not None:
+            query_vars.append('update.chain=%s' % updateChain)
 
         if query_vars:
             path = '%s?%s' % (path, '&'.join(query_vars))
@@ -613,10 +583,7 @@ class Solr(object):
         """
         if hasattr(value, 'strftime'):
             if hasattr(value, 'hour'):
-                offset = value.utcoffset()
-                if offset:
-                    value = value - offset
-                value = value.replace(tzinfo=None).isoformat() + 'Z'
+                value = "%sZ" % value.isoformat()
             else:
                 value = "%sT00:00:00Z" % value.isoformat()
         elif isinstance(value, bool):
@@ -713,7 +680,7 @@ class Solr(object):
 
     # API Methods ############################################################
 
-    def search(self, q, search_handler=None, **kwargs):
+    def search(self, q, search_handler='select', **kwargs):
         """
         Performs a search and returns the results.
 
@@ -739,7 +706,7 @@ class Solr(object):
         """
         params = {'q': q}
         params.update(kwargs)
-        response = self._select(params, handler=search_handler)
+        response = self._select(params, search_handler)
         decoded = self.decoder.decode(response)
 
         self.log.debug(
@@ -749,7 +716,7 @@ class Solr(object):
         )
         return self.results_cls(decoded)
 
-    def more_like_this(self, q, mltfl, handler='mlt', **kwargs):
+    def more_like_this(self, q, mltfl, **kwargs):
         """
         Finds and returns results similar to the provided query.
 
@@ -768,7 +735,7 @@ class Solr(object):
             'mlt.fl': mltfl,
         }
         params.update(kwargs)
-        response = self._mlt(params, handler=handler)
+        response = self._mlt(params)
         decoded = self.decoder.decode(response)
 
         self.log.debug(
@@ -778,7 +745,7 @@ class Solr(object):
         )
         return self.results_cls(decoded)
 
-    def suggest_terms(self, fields, prefix, handler='terms', **kwargs):
+    def suggest_terms(self, fields, prefix, **kwargs):
         """
         Accepts a list of field names and a prefix
 
@@ -792,7 +759,7 @@ class Solr(object):
             'terms.prefix': prefix,
         }
         params.update(kwargs)
-        response = self._suggest_terms(params, handler=handler)
+        response = self._suggest_terms(params)
         result = self.decoder.decode(response)
         terms = result.get("terms", {})
         res = {}
@@ -820,28 +787,18 @@ class Solr(object):
         doc_elem = ElementTree.Element('doc')
 
         for key, value in doc.items():
-            if key == NESTED_DOC_KEY:
-                for child in value:
-                    doc_elem.append(self._build_doc(child, boost, fieldUpdates))
-                continue
-
             if key == 'boost':
                 doc_elem.set('boost', force_unicode(value))
                 continue
 
             # To avoid multiple code-paths we'd like to treat all of our values as iterables:
-            if isinstance(value, (list, tuple, set)):
+            if isinstance(value, (list, tuple)):
                 values = value
             else:
                 values = (value, )
 
             for bit in values:
                 if self._is_null_value(bit):
-                    continue
-
-                if key == '_doc':
-                    child = self._build_doc(bit, boost)
-                    doc_elem.append(child)
                     continue
 
                 attrs = {'name': key}
@@ -859,15 +816,14 @@ class Solr(object):
 
         return doc_elem
 
-    def add(self, docs, boost=None, fieldUpdates=None, commit=None, softCommit=False, commitWithin=None, waitFlush=None,
-            waitSearcher=None, overwrite=None, handler='update'):
+    def add(self, docs, boost=None, fieldUpdates=None, commit=True, softCommit=False, commitWithin=None, waitFlush=None, waitSearcher=None, overwrite=None, updateChain=None):
         """
         Adds or updates documents.
 
         Requires ``docs``, which is a list of dictionaries. Each key is the
         field name and each value is the value to index.
 
-        Optionally accepts ``commit``. Default is ``None``. None signals to use default
+        Optionally accepts ``commit``. Default is ``True``.
 
         Optionally accepts ``softCommit``. Default is ``False``.
 
@@ -904,8 +860,7 @@ class Solr(object):
             message.set('commitWithin', commitWithin)
 
         for doc in docs:
-            el = self._build_doc(doc, boost=boost, fieldUpdates=fieldUpdates)
-            message.append(el)
+            message.append(self._build_doc(doc, boost=boost, fieldUpdates=fieldUpdates))
 
         # This returns a bytestring. Ugh.
         m = ElementTree.tostring(message, encoding='utf-8')
@@ -914,21 +869,17 @@ class Solr(object):
 
         end_time = time.time()
         self.log.debug("Built add request of %s docs in %0.2f seconds.", len(message), end_time - start_time)
-        return self._update(m, commit=commit, softCommit=softCommit, waitFlush=waitFlush, waitSearcher=waitSearcher,
-                            overwrite=overwrite, handler=handler)
+        return self._update(m, commit=commit, softCommit=softCommit, waitFlush=waitFlush, waitSearcher=waitSearcher, overwrite=overwrite, updateChain=updateChain)
 
-    def delete(self, id=None, q=None, commit=None, softCommit=False, waitFlush=None, waitSearcher=None, handler='update'):
+    def delete(self, id=None, q=None, commit=True, waitFlush=None, waitSearcher=None):
         """
         Deletes documents.
 
         Requires *either* ``id`` or ``query``. ``id`` is if you know the
-        specific document id to remove. Note that ``id`` can also be a list of
-        document ids to be deleted. ``query`` is a Lucene-style query
+        specific document id to remove. ``query`` is a Lucene-style query
         indicating a collection of documents to delete.
 
         Optionally accepts ``commit``. Default is ``True``.
-
-        Optionally accepts ``softCommit``. Default is ``False``.
 
         Optionally accepts ``waitFlush``. Default is ``None``.
 
@@ -937,7 +888,6 @@ class Solr(object):
         Usage::
 
             solr.delete(id='doc_12')
-            solr.delete(id=['doc_1', 'doc_3'])
             solr.delete(q='*:*')
 
         """
@@ -946,20 +896,13 @@ class Solr(object):
         elif id is not None and q is not None:
             raise ValueError('You many only specify "id" OR "q", not both.')
         elif id is not None:
-            if not isinstance(id, (list, set, tuple)):
-                id = [id]
-            else:
-                id = list(filter(None, id))
-            if id:
-                m = '<delete>%s</delete>' % ''.join('<id>%s</id>' % i for i in id)
-            else:
-                raise ValueError('The list of documents to delete was empty.')
+            m = '<delete><id>%s</id></delete>' % id
         elif q is not None:
             m = '<delete><query>%s</query></delete>' % q
 
-        return self._update(m, commit=commit, softCommit=softCommit, waitFlush=waitFlush, waitSearcher=waitSearcher, handler=handler)
+        return self._update(m, commit=commit, waitFlush=waitFlush, waitSearcher=waitSearcher)
 
-    def commit(self, softCommit=False, waitFlush=None, waitSearcher=None, expungeDeletes=None, handler='update'):
+    def commit(self, softCommit=False, waitFlush=None, waitSearcher=None, expungeDeletes=None):
         """
         Forces Solr to write the index data to disk.
 
@@ -981,9 +924,9 @@ class Solr(object):
         else:
             msg = '<commit />'
 
-        return self._update(msg, commit=not softCommit, softCommit=softCommit, waitFlush=waitFlush, waitSearcher=waitSearcher, handler=handler)
+        return self._update(msg, softCommit=softCommit, waitFlush=waitFlush, waitSearcher=waitSearcher)
 
-    def optimize(self, commit=True, waitFlush=None, waitSearcher=None, maxSegments=None, handler='update'):
+    def optimize(self, waitFlush=None, waitSearcher=None, maxSegments=None):
         """
         Tells Solr to streamline the number of segments used, essentially a
         defragmentation operation.
@@ -1004,9 +947,9 @@ class Solr(object):
         else:
             msg = '<optimize />'
 
-        return self._update(msg, commit=commit, waitFlush=waitFlush, waitSearcher=waitSearcher, handler=handler)
+        return self._update(msg, waitFlush=waitFlush, waitSearcher=waitSearcher)
 
-    def extract(self, file_obj, extractOnly=True, handler='update/extract', **kwargs):
+    def extract(self, file_obj, extractOnly=True, **kwargs):
         """
         POSTs a file to the Solr ExtractingRequestHandler so rich content can
         be processed using Apache Tika. See the Solr wiki for details:
@@ -1039,13 +982,13 @@ class Solr(object):
             "wt": "json",
         }
         params.update(kwargs)
-        filename = quote(file_obj.name.encode('utf-8'))
+
         try:
             # We'll provide the file using its true name as Tika may use that
             # as a file type hint:
-            resp = self._send_request('post', handler,
+            resp = self._send_request('post', 'update/extract',
                                       body=params,
-                                      files={'file': (filename, file_obj)})
+                                      files={'file': (file_obj.name, file_obj)})
         except (IOError, SolrError) as err:
             self.log.error("Failed to extract document metadata: %s", err,
                            exc_info=True)
@@ -1058,10 +1001,10 @@ class Solr(object):
                            exc_info=True)
             raise
 
-        data['contents'] = data.pop(filename, None)
+        data['contents'] = data.pop(file_obj.name, None)
         data['metadata'] = metadata = {}
 
-        raw_metadata = data.pop("%s_metadata" % filename, None)
+        raw_metadata = data.pop("%s_metadata" % file_obj.name, None)
 
         if raw_metadata:
             # The raw format is somewhat annoying: it's a flat list of
@@ -1075,11 +1018,6 @@ class Solr(object):
 class SolrCoreAdmin(object):
     """
     Handles core admin operations: see http://wiki.apache.org/solr/CoreAdmin
-
-    This must be initialized with the full admin cores URL::
-
-        solr_admin = SolrCoreAdmin('http://localhost:8983/solr/admin/cores')
-        status = solr_admin.status()
 
     Operations offered by Solr are:
        1. STATUS
@@ -1210,18 +1148,21 @@ def sanitize(data):
 
 class SolrCloud(Solr):
 
-    def __init__(self, zookeeper, collection, decoder=None, timeout=60, retry_timeout=0.2, auth=None, verify=True,
-                 *args, **kwargs):
-        url = zookeeper.getRandomURL(collection)
-        self.auth = auth
-        self.verify = verify
+    def __init__(self, zookeeper, collection, decoder=None, timeout=60, retry_timeout=0.02, retry_count=20, *args, **kwargs):
+        url = "NULL_URL"
 
-        super(SolrCloud, self).__init__(url, decoder=decoder, timeout=timeout, auth=self.auth, verify = self.verify,
-                                        *args, **kwargs)
+        super(SolrCloud, self).__init__(url, decoder=decoder, timeout=timeout, *args, **kwargs)
 
         self.zookeeper = zookeeper
         self.collection = collection
         self.retry_timeout = retry_timeout
+        self.retry_count = retry_count
+        if collection in self.zookeeper.aliases:
+            collections = self.zookeeper.aliases[collection].split(",")
+            for aliased_collection in collections:
+                self.zookeeper.watchCollection(aliased_collection)
+        elif collection:
+            self.zookeeper.watchCollection(collection)
 
     def _randomized_request(self, method, path, body, headers, files):
         self.url = self.zookeeper.getRandomURL(self.collection)
@@ -1229,17 +1170,15 @@ class SolrCloud(Solr):
         return Solr._send_request(self, method, path, body, headers, files)
 
     def _send_request(self, method, path='', body=None, headers=None, files=None):
-        # FIXME: this needs to have a maximum retry counter rather than waiting endlessly
-        try:
-            return self._randomized_request(method, path, body, headers, files)
-        except requests.exceptions.RequestException:
-            LOG.warning('RequestException, retrying after %fs', self.retry_timeout, exc_info=True)
-            time.sleep(self.retry_timeout)  # give zookeeper time to notice
-            return self._randomized_request(method, path, body, headers, files)
-        except SolrError:
-            LOG.warning('SolrException, retrying after %fs', self.retry_timeout, exc_info=True)
-            time.sleep(self.retry_timeout)  # give zookeeper time to notice
-            return self._randomized_request(method, path, body, headers, files)
+        retry_count=self.retry_count
+        while retry_count > 0:
+            try:
+                return self._randomized_request(method, path, body, headers, files)
+            except (requests.exceptions.RequestException, SolrError) as e:
+                LOG.warning('RequestException, retrying after %fs', self.retry_timeout, exc_info=True)
+                time.sleep(self.retry_timeout)  # give zookeeper time to notice
+                retry_count -= 1
+        raise SolrError("Too many retries for %s" % path)
 
     def _update(self, *args, **kwargs):
         self.url = self.zookeeper.getLeaderURL(self.collection)
@@ -1261,25 +1200,25 @@ class ZooKeeper(object):
     TRUE = 'true'
     FALSE = 'false'
     COLLECTION = 'collection'
+    COLLECTION_STATE = '/collections/{}/state.json'
+    NODE_NAME = 'node_name'
 
-    def __init__(self, zkServerAddress, timeout=15, max_retries=-1, kazoo_client=None):
+    def __init__(self, zkServerAddress, zkClientTimeout=15, zkClientConnectTimeout=15):
         if KazooClient is None:
             logging.error('ZooKeeper requires the `kazoo` library to be installed')
             raise RuntimeError
 
+        self.watchedCollections = []
         self.collections = {}
         self.liveNodes = {}
         self.aliases = {}
         self.state = None
+        self.hasClusterState = False
 
-        if kazoo_client is None:
-            self.zk = KazooClient(zkServerAddress, read_only=True, timeout=timeout,
-                                  command_retry={'max_tries': max_retries},
-                                  connection_retry={'max_tries': max_retries})
-        else:
-            self.zk = kazoo_client
+        self.zk = KazooClient(zkServerAddress, read_only=True)
 
         self.zk.start()
+        random.seed()
 
         def connectionListener(state):
             if state == KazooState.LOST:
@@ -1294,6 +1233,7 @@ class ZooKeeper(object):
                 LOG.warning("No cluster state available: no collections defined?")
             else:
                 self.collections = json.loads(data.decode('utf-8'))
+                self.hasClusterState = True
                 LOG.info('Updated collections: %s', self.collections)
 
         @self.zk.ChildrenWatch(ZooKeeper.LIVE_NODES_ZKNODE)
@@ -1305,14 +1245,30 @@ class ZooKeeper(object):
         def watchAliases(data, stat):
             if data:
                 json_data = json.loads(data.decode('utf-8'))
-                if ZooKeeper.COLLECTION in json_data:
+                if ZooKeeper.COLLECTION in json_data and json_data[ZooKeeper.COLLECTION]:
                     self.aliases = json_data[ZooKeeper.COLLECTION]
                 else:
                     LOG.warning('Expected to find %s in alias update %s',
                                 ZooKeeper.COLLECTION, json_data.keys())
             else:
-                self.aliases = None
+                self.aliases = {}
             LOG.info("Updated aliases: %s", self.aliases)
+
+    def watchCollection(self, collection):
+        path = ZooKeeper.COLLECTION_STATE.format(collection)
+        def watch(event=None):
+            data = self.zk.get(path, watch=watch)
+            self.collections[collection] = json.loads(data[0].decode("utf8"))[collection]
+        try:
+            watch()
+        except NoNodeError as e:
+            if (self.hasClusterState and collection not in self.collections) or not self.hasClusterState:
+                raise SolrError("No collection %s" % collection)
+
+    def __del__(self):
+        # Avoid leaking connection handles in Kazoo's atexit handler:
+        self.zk.stop()
+        self.zk.close()
 
     def getHosts(self, collname, only_leader=False, seen_aliases=None):
         if self.aliases and collname in self.aliases:
@@ -1320,7 +1276,7 @@ class ZooKeeper(object):
 
         hosts = []
         if collname not in self.collections:
-            raise SolrError("Unknown collection: %s" % collname)
+            raise SolrError("Unknown collection: %s", collname)
         collection = self.collections[collname]
         shards = collection[ZooKeeper.SHARDS]
         for shardname in shards.keys():
@@ -1334,7 +1290,8 @@ class ZooKeeper(object):
                         if not only_leader or (replica.get(ZooKeeper.LEADER, None) == ZooKeeper.TRUE):
                             base_url = replica[ZooKeeper.BASE_URL]
                             if base_url not in hosts:
-                                hosts.append(base_url)
+                                if replica[ZooKeeper.NODE_NAME] in self.liveNodes:
+                                    hosts.append(base_url)
         return hosts
 
     def getAliasHosts(self, collname, only_leader, seen_aliases):
@@ -1353,11 +1310,14 @@ class ZooKeeper(object):
                     hosts.append(host)
         return hosts
 
-    def getRandomURL(self, collname, only_leader=False):
-        hosts = self.getHosts(collname, only_leader=only_leader)
-        if not hosts:
-            raise SolrError('ZooKeeper returned no active shards!')
-        return '%s/%s' % (random.choice(hosts), collname)
+    def getRandomURL(self, collname):
+        hosts = self.getHosts(collname, only_leader=False)
+        if len(hosts)==0:
+            raise SolrError("No hosts available for %s" % collname)
+        return random.choice(hosts) + "/" + collname
 
     def getLeaderURL(self, collname):
-        return self.getRandomURL(collname, only_leader=True)
+        hosts = self.getHosts(collname, only_leader=True)
+        if len(hosts) == 0:
+            raise SolrError("No leaders available for %s" % collname)
+        return random.choice(hosts) + "/" + collname
